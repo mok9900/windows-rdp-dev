@@ -16,6 +16,8 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 360
     steps:
+      - name: Fetch development relay agent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Configure development account and RDP
         shell: pwsh
         env:
@@ -37,31 +39,22 @@ jobs:
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
           Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
           Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Disable-NetFirewallRule
-          New-NetFirewallRule -DisplayName 'Development RDP over Tailscale' -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Action Allow
+          New-NetFirewallRule -DisplayName 'Development RDP loopback only' -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress 127.0.0.1 -Action Allow
           Start-Service TermService
-      - name: Install Tailscale
+          if (-not (Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) { throw 'RDP is not listening.' }
+      - name: Install outbound relay dependency
         shell: pwsh
         run: |
-          choco install tailscale --yes --no-progress
-          if ($LASTEXITCODE -ne 0) { throw 'Tailscale installation failed.' }
-      - name: Authorize Tailscale (open the login URL in this step)
-        shell: pwsh
-        run: |
-          & 'C:\Program Files\Tailscale\tailscale.exe' up --unattended --hostname "windows-dev-${{ github.run_id }}" --timeout=15m
-          if ($LASTEXITCODE -ne 0) { throw 'Tailscale authorization did not complete.' }
-      - name: Connection details and development session
+          python -m pip install aiohttp==3.14.3 --disable-pip-version-check
+          if ($LASTEXITCODE -ne 0) { throw 'Relay dependency installation failed.' }
+      - name: Reverse RDP development session
         shell: pwsh
         env:
           SESSION_MINUTES: ${{ inputs.minutes }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
         run: |
-          $address = & 'C:\Program Files\Tailscale\tailscale.exe' ip -4
-          if ($LASTEXITCODE -ne 0 -or -not $address) { throw 'No Tailscale address.' }
-          if (-not (Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) { throw 'RDP is not listening.' }
-          @('Connect using Windows App / mstsc from a device signed into the same Tailscale network.', "Address: ${address}:3389", 'Username: .\seoulsexyking', 'Password: the configured RDP_PASSWORD secret', 'Save work outside this VM before ending the session.') | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY
-          $deadline = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
-          while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
-      - name: Disconnect
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') { & 'C:\Program Files\Tailscale\tailscale.exe' logout }
+          if (-not $env:RELAY_URL -or -not $env:RELAY_TOKEN) { throw 'Gateway secrets are required.' }
+          @('Native RDP through the current workspace gateway.', 'Username: .\seoulsexyking', 'Password: the configured RDP_PASSWORD secret', 'Save work outside this VM before ending the session.') | Set-Content $env:GITHUB_STEP_SUMMARY
+          python -u gateway/windows_agent.py
+          if ($LASTEXITCODE -ne 0) { throw 'Development relay failed.' }
