@@ -1,0 +1,67 @@
+name: Windows development RDP
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Development session duration (15–330 minutes)
+        default: '60'
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: windows-development-rdp
+  cancel-in-progress: false
+jobs:
+  desktop:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      - name: Configure development account and RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          SESSION_MINUTES: ${{ inputs.minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $minutes = 0
+          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes) -or $minutes -lt 15 -or $minutes -gt 330) { throw 'Duration must be 15–330 minutes.' }
+          if (-not $env:RDP_PASSWORD) { throw 'RDP_PASSWORD secret is required.' }
+          $policy = Join-Path $env:RUNNER_TEMP 'development-security.inf'
+          @('[Unicode]', 'Unicode=yes', '[System Access]', 'PasswordComplexity = 0', '[Version]', 'signature="$CHICAGO$"', 'Revision=1') | Set-Content $policy
+          secedit.exe /configure /db "$env:RUNNER_TEMP\development-security.sdb" /cfg $policy /areas SECURITYPOLICY
+          if ($LASTEXITCODE -ne 0) { throw 'Could not configure local password policy.' }
+          $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name 'seoulsexyking' -Password $password -Description 'Temporary development session'
+          Add-LocalGroupMember -SID 'S-1-5-32-555' -Member 'seoulsexyking'
+          Add-LocalGroupMember -SID 'S-1-5-32-544' -Member 'seoulsexyking'
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Disable-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'Development RDP over Tailscale' -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Action Allow
+          Start-Service TermService
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          choco install tailscale --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale installation failed.' }
+      - name: Authorize Tailscale (open the login URL in this step)
+        shell: pwsh
+        run: |
+          & 'C:\Program Files\Tailscale\tailscale.exe' up --unattended --hostname "windows-dev-${{ github.run_id }}" --timeout=15m
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale authorization did not complete.' }
+      - name: Connection details and development session
+        shell: pwsh
+        env:
+          SESSION_MINUTES: ${{ inputs.minutes }}
+        run: |
+          $address = & 'C:\Program Files\Tailscale\tailscale.exe' ip -4
+          if ($LASTEXITCODE -ne 0 -or -not $address) { throw 'No Tailscale address.' }
+          if (-not (Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) { throw 'RDP is not listening.' }
+          @('Connect using Windows App / mstsc from a device signed into the same Tailscale network.', "Address: ${address}:3389", 'Username: .\seoulsexyking', 'Password: the configured RDP_PASSWORD secret', 'Save work outside this VM before ending the session.') | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY
+          $deadline = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
+          while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
+      - name: Disconnect
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') { & 'C:\Program Files\Tailscale\tailscale.exe' logout }
